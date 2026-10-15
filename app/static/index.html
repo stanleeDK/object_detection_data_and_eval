@@ -1,0 +1,142 @@
+<!doctype html>
+<!-- Detect page: pick a photo, the server runs your trained model, we draw the boxes. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Shoe Detector</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/common.js"></script>
+</head>
+<body>
+  <header>
+    <h1>👟 Shoe Detector</h1>
+    <nav><a href="/upload">Upload</a><a href="/photos">Photos</a><a href="/review">Review</a><a href="/eval">Eval sets</a><a href="/train">Train</a><a href="/results">Results</a><a href="/" class="active">Detect</a></nav>
+  </header>
+
+  <main class="detect">
+    <div class="toolbar">
+      <input type="file" id="file" accept="image/*">
+      <label>Min confidence <input type="range" id="threshold" min="0.05" max="0.95" step="0.05" value="0.5">
+        <span id="threshold-value">0.50</span></label>
+      <span class="muted small" id="model-name"></span>
+    </div>
+
+    <div id="notice" class="notice" hidden></div>
+
+    <div id="dropzone" class="dropzone">
+      <div id="placeholder" class="muted">Drop a photo here, paste one (<kbd>⌘V</kbd>), or use “Choose File”.</div>
+      <canvas id="canvas" hidden></canvas>
+    </div>
+
+    <section class="results" id="results" hidden>
+      <div class="counts" id="counts"></div>
+      <div class="muted small" id="summary"></div>
+    </section>
+  </main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+// The current photo (as a loaded <img>) and every box the model returned for it.
+// Boxes come with corners as 0-1 fractions, so they fit whatever size we draw the photo at.
+const state = { img: null, detections: [] };
+
+// On page load: ask the server which model is loaded.
+async function init() {
+  const info = await api("/api/info");
+  if (info.model) {
+    $("model-name").textContent = `Model: ${info.model.path}`;
+  } else {
+    showNotice("No model has been trained yet. Review photos on the Review page, then run training (see README.md).");
+  }
+}
+
+function showNotice(text, isError = false) {
+  const notice = $("notice");
+  notice.textContent = text;
+  notice.className = "notice" + (isError ? " error" : "");
+  notice.hidden = !text;
+}
+
+// Send the photo to the server, then show it with the returned boxes.
+async function detect(file) {
+  showNotice("");
+  $("placeholder").textContent = "Detecting…";
+  const body = new FormData();
+  body.append("file", file);
+  try {
+    const result = await api("/api/detect", { method: "POST", body });
+    state.img = await loadImage(URL.createObjectURL(file));  // show the photo straight from the user's file
+    state.detections = result.detections;
+    render();
+  } catch (e) {
+    $("placeholder").textContent = "Drop a photo here, paste one, or use “Choose File”.";
+    showNotice(e.message, true);
+  }
+}
+
+// Draw the photo plus every box at or above the slider's confidence. Runs again whenever the
+// slider moves; this happens only in the browser, the model isn't re-run.
+function render() {
+  const { img, detections } = state;
+  if (!img) return;
+  const threshold = parseFloat($("threshold").value);
+  $("threshold-value").textContent = threshold.toFixed(2);
+
+  // Fit the photo into the page (never enlarge it).
+  const canvas = $("canvas");
+  const maxWidth = $("dropzone").clientWidth - 36, maxHeight = window.innerHeight * 0.75;
+  const scale = Math.min(maxWidth / img.naturalWidth, maxHeight / img.naturalHeight, 1);
+  const w = Math.round(img.naturalWidth * scale), h = Math.round(img.naturalHeight * scale);
+  // Retina screens have 2+ real pixels per CSS pixel; draw at full resolution so it's sharp.
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  canvas.style.width = w + "px"; canvas.style.height = h + "px";
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.drawImage(img, 0, 0, w, h);
+
+  const shown = detections.filter((d) => d.score >= threshold);
+  for (const d of shown) {
+    const [x1, y1, x2, y2] = d.box;  // fractions -> canvas pixels
+    drawBox(ctx, { x1: x1 * w, y1: y1 * h, x2: x2 * w, y2: y2 * h }, classColor(d.cls), `${d.name} ${(d.score * 100).toFixed(0)}%`);
+  }
+  canvas.hidden = false;
+  $("placeholder").hidden = true;
+
+  // Summary chips, e.g. "2 × sneaker".
+  const counts = {};
+  for (const d of shown) counts[d.cls] = (counts[d.cls] || 0) + 1;
+  $("counts").innerHTML = Object.keys(counts).length
+    ? Object.entries(counts).map(([cls, n]) => {
+        const name = shown.find((d) => d.cls == cls).name;
+        return `<span class="chip"><span class="swatch" style="background:${classColor(+cls)}"></span>${n} × ${name}</span>`;
+      }).join("")
+    : `<span class="chip">No shoes found above ${threshold.toFixed(2)}</span>`;
+  const hiddenCount = detections.length - shown.length;
+  $("summary").textContent = hiddenCount ? `${hiddenCount} lower-confidence box${hiddenCount > 1 ? "es" : ""} hidden — lower the slider to see them.` : "";
+  $("results").hidden = false;
+}
+
+// Three ways to give it a photo: the file picker, drag & drop, or paste.
+$("file").addEventListener("change", (e) => e.target.files[0] && detect(e.target.files[0]));
+const zone = $("dropzone");
+zone.addEventListener("dragover", (e) => { e.preventDefault(); zone.classList.add("drag"); });
+zone.addEventListener("dragleave", () => zone.classList.remove("drag"));
+zone.addEventListener("drop", (e) => {
+  e.preventDefault(); zone.classList.remove("drag");
+  if (e.dataTransfer.files[0]) detect(e.dataTransfer.files[0]);
+});
+document.addEventListener("paste", (e) => {
+  const file = [...e.clipboardData.files].find((f) => f.type.startsWith("image/"));
+  if (file) detect(file);
+});
+
+$("threshold").addEventListener("input", render);
+window.addEventListener("resize", render);
+
+init().catch((e) => showNotice(e.message, true));
+</script>
+</body>
+</html>

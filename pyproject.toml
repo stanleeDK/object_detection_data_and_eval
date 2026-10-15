@@ -1,0 +1,15 @@
+[project]
+name = "shoe-detector"
+version = "0.1.0"
+description = "Website that detects shoes in photos, using a fine-tuned D-FINE model"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "dfine-seg>=0.5.1",          # D-FINE detector: training (`dfine` CLI) + inference
+    "fastapi>=0.115",            # web server
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",   # image uploads
+    "pillow>=10",                # image handling for Grounding DINO
+    "transformers>=4.50",        # Grounding DINO (labeling helper)
+    "pyyaml>=6.0.3",             # reading class names from config.yaml
+    "pillow-heif>=1.8.1",
+]

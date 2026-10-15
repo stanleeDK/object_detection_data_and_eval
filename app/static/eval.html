@@ -1,0 +1,216 @@
+<!doctype html>
+<!--
+  Eval sets page: create, edit, freeze and version the photo sets used to grade models.
+  Rules live in app/evalsets.py: a new set starts as a random X% of eligible photos (accepted +
+  reviewed); while it's a draft you can remove photos, add specific ones or add more at random;
+  freezing locks the photos and copies their boxes, forever; changes after that = a new version.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Eval Sets</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/common.js"></script>
+</head>
+<body>
+  <header>
+    <h1>👟 Shoe Detector</h1>
+    <nav><a href="/upload">Upload</a><a href="/photos">Photos</a><a href="/review">Review</a><a href="/eval" class="active">Eval sets</a><a href="/train">Train</a><a href="/results">Results</a><a href="/">Detect</a></nav>
+  </header>
+
+  <main class="eval-layout">
+    <aside class="eval-side">
+      <h3>Eval sets</h3>
+      <div id="set-list" class="set-list"></div>
+
+      <h3>New eval set</h3>
+      <div class="class-form">
+        <input type="text" id="new-name" placeholder="name, e.g. shoes-eval">
+        <label class="small">Draw photos from
+          <select id="new-category"></select>
+        </label>
+        <label class="small">Start with <input type="number" id="new-percent" value="10" min="1" max="100" style="width:64px"> % of them, at random</label>
+        <input type="text" id="new-notes" placeholder="notes (optional)">
+        <button id="create" class="primary">Create draft</button>
+        <p class="muted small">Only photos that are accepted and reviewed can be in an eval set. You can change the draft before freezing it.</p>
+      </div>
+    </aside>
+
+    <section class="eval-main">
+      <div id="notice" class="notice" hidden></div>
+      <div id="empty" class="muted">Choose an eval set on the left, or create one.</div>
+
+      <div id="detail" hidden>
+        <div class="toolbar">
+          <h2 id="set-title" style="margin:0"></h2>
+          <span id="set-state" class="badge"></span>
+        </div>
+        <p id="set-facts" class="muted small"></p>
+        <div id="class-totals" class="counts"></div>
+
+        <div class="toolbar" id="draft-actions">
+          <label class="small">Add <input type="number" id="random-count" value="5" min="1" style="width:64px"> more at random</label>
+          <button id="add-random">Add</button>
+          <button id="freeze" class="primary">Freeze…</button>
+          <button id="delete" class="danger">Delete draft</button>
+        </div>
+        <div class="toolbar" id="frozen-actions">
+          <button id="new-version">Make a new version…</button>
+          <span class="muted small">Copies this set into an editable draft with the next version number.</span>
+        </div>
+
+        <h3>Photos in this set</h3>
+        <div id="set-photos" class="photo-grid"></div>
+
+        <div id="candidates-section">
+          <h3>Add specific photos <span id="candidate-count" class="muted small"></span></h3>
+          <p class="muted small">Eligible photos not in this set yet. Click one to add it.</p>
+          <div id="candidates" class="photo-grid"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const jsonBody = (data) => ({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+let classNames = {};     // class id -> name
+let current = null;      // the selected set's details: {eval_set, photos, candidates}
+
+async function init() {
+  const classes = (await api("/api/classes")).classes;
+  classNames = Object.fromEntries(classes.map((c) => [c.id, c.name]));
+  await loadSets();
+}
+
+// Left column: every eval set, newest version first within each name.
+async function loadSets() {
+  const data = await api("/api/eval-sets");
+  $("new-category").innerHTML = `<option value="">any category</option>` +
+    data.categories.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("");
+  $("set-list").innerHTML = data.eval_sets.length ? data.eval_sets.map((e) => `
+    <button class="set-row ${current?.eval_set.id === e.id ? "current" : ""}" data-id="${e.id}">
+      <b>${escapeHtml(e.name)} v${e.version}</b>
+      <span class="badge ${e.frozen_at ? "" : "draft"}">${e.frozen_at ? "FROZEN" : "DRAFT"}</span>
+      <span class="muted small">${e.n_photos} photo${e.n_photos === 1 ? "" : "s"}</span>
+    </button>`).join("") : `<p class="muted small">None yet.</p>`;
+}
+
+$("set-list").addEventListener("click", (e) => {
+  const row = e.target.closest(".set-row");
+  if (row) openSet(+row.dataset.id);
+});
+
+async function openSet(id) {
+  showNotice("");
+  show(await api(`/api/eval-sets/${id}`));
+}
+
+// Right side: one set's facts, actions, photos and (for drafts) candidates.
+function show(details) {
+  current = details;
+  const { eval_set: e, photos, candidates } = details;
+  const frozen = !!e.frozen_at;
+  $("empty").hidden = true;
+  $("detail").hidden = false;
+  $("set-title").textContent = `${e.name} v${e.version}`;
+  $("set-state").textContent = frozen ? "FROZEN" : "DRAFT";
+  $("set-state").className = "badge" + (frozen ? "" : " draft");
+  $("set-facts").textContent = [
+    `photos from: ${e.category || "any category"}`,
+    `created ${e.created_at.replace("T", " ")}`,
+    frozen ? `frozen ${e.frozen_at.replace("T", " ")} (photos and boxes locked)` : "draft: boxes shown are the photos' current reviewed boxes",
+    e.notes,
+  ].filter(Boolean).join(" · ");
+
+  // Totals: photos and boxes per class across the whole set.
+  const totals = {};
+  for (const p of photos) for (const [cls, n] of Object.entries(p.box_counts)) totals[cls] = (totals[cls] || 0) + n;
+  $("class-totals").innerHTML = `<span class="chip">${photos.length} photos</span>` + Object.entries(totals)
+    .map(([cls, n]) => `<span class="chip"><span class="swatch" style="background:${classColor(+cls)}"></span>${n} × ${escapeHtml(classNames[cls] ?? cls)}</span>`).join("");
+
+  $("draft-actions").hidden = frozen;
+  $("frozen-actions").hidden = !frozen;
+  $("set-photos").innerHTML = photos.length ? photos.map((p) => card(p, frozen ? "" : "remove")).join("") : `<p class="muted">No photos in this set.</p>`;
+  $("candidates-section").hidden = frozen;
+  $("candidate-count").textContent = `(${candidates.length})`;
+  $("candidates").innerHTML = candidates.length ? candidates.map((p) => card(p, "add")).join("") : `<p class="muted small">No other eligible photos. Review more photos first.</p>`;
+  loadSets();
+}
+
+// One photo card: thumbnail, name, boxes per class, and an add/remove action.
+function card(p, action) {
+  const boxes = Object.entries(p.box_counts).map(([cls, n]) => `${n}× ${escapeHtml(classNames[cls] ?? cls)}`).join(", ") || "no boxes";
+  const warning = p.status && (p.status !== "accepted" || !p.reviewed) ? `<div class="bad small">${p.status !== "accepted" ? "rejected" : "not reviewed"}</div>` : "";
+  return `
+    <div class="photo-card" ${action ? `data-action="${action}" data-id="${p.id}" title="${action === "add" ? "Add to this set" : ""}"` : ""}>
+      <img src="/api/photos/${p.id}/thumb" loading="lazy" alt="">
+      <div class="card-text">
+        <div class="small">${boxes}</div>
+        ${p.sku ? `<div class="small">${escapeHtml(p.sku)}</div>` : ""}
+        <div class="muted small name">${escapeHtml(p.original_name)}</div>
+        ${warning}
+        ${action === "remove" ? `<button class="small danger" data-remove="${p.id}">Remove</button>` : ""}
+      </div>
+    </div>`;
+}
+
+// Every change goes through POST /api/eval-sets/<id>/<action> and returns the updated set.
+async function act(action, body = {}) {
+  try {
+    showNotice("");
+    const result = await api(`/api/eval-sets/${current.eval_set.id}/${action}`, { method: "POST", ...jsonBody(body) });
+    if (action === "delete") {
+      current = null;
+      $("detail").hidden = true;
+      $("empty").hidden = false;
+      loadSets();
+    } else {
+      show(result);
+    }
+  } catch (e) {
+    showNotice(e.message, true);
+  }
+}
+
+$("set-photos").addEventListener("click", (e) => {
+  const button = e.target.closest("[data-remove]");
+  if (button) act("remove", { photo_ids: [button.dataset.remove] });
+});
+$("candidates").addEventListener("click", (e) => {
+  const cardEl = e.target.closest("[data-action='add']");
+  if (cardEl) act("add", { photo_ids: [cardEl.dataset.id] });
+});
+$("add-random").addEventListener("click", () => act("random", { count: +$("random-count").value }));
+$("freeze").addEventListener("click", () => {
+  const n = current.photos.length;
+  if (confirm(`Freeze ${current.eval_set.name} v${current.eval_set.version} with ${n} photos?\n\nThe photos and their boxes are locked permanently. Later changes need a new version.`)) act("freeze");
+});
+$("delete").addEventListener("click", () => { if (confirm("Delete this draft? Its photos go back to being training photos.")) act("delete"); });
+$("new-version").addEventListener("click", () => {
+  if (confirm(`Create a new draft version of ${current.eval_set.name} with the same photos?`)) act("new-version");
+});
+
+$("create").addEventListener("click", async () => {
+  try {
+    showNotice("");
+    show(await api("/api/eval-sets", { method: "POST", ...jsonBody({
+      name: $("new-name").value, category: $("new-category").value,
+      percent: +$("new-percent").value, notes: $("new-notes").value }) }));
+    $("new-name").value = $("new-notes").value = "";
+  } catch (e) {
+    showNotice(e.message, true);
+  }
+});
+
+function showNotice(text, isError = false) {
+  $("notice").textContent = text;
+  $("notice").className = "notice" + (isError ? " error" : "");
+  $("notice").hidden = !text;
+}
+
+init().catch((e) => showNotice(e.message, true));
+</script>
+</body>
+</html>

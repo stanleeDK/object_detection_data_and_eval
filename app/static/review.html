@@ -1,0 +1,552 @@
+<!doctype html>
+<!--
+  Review page: check the boxes the models proposed for each accepted photo, fix them, save.
+
+  Proposed boxes (machine guesses) are dashed and labeled with who made them. Saving sends the
+  photo's final boxes to PUT /api/review/<id>; app/review.py then marks each proposed box
+  accepted (unchanged) or rejected (deleted/changed), and stores boxes you drew or fixed as yours.
+
+  Layout: left = review queue, middle = the photo with its boxes (a <canvas>),
+          right = your name, classes (+ add/edit), keyboard shortcuts.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Review Photos</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/common.js"></script>
+</head>
+<body>
+  <header>
+    <h1>👟 Shoe Detector</h1>
+    <nav><a href="/upload">Upload</a><a href="/photos">Photos</a><a href="/review" class="active">Review</a><a href="/eval">Eval sets</a><a href="/train">Train</a><a href="/results">Results</a><a href="/">Detect</a></nav>
+  </header>
+
+  <div class="label-layout">
+    <aside class="sidebar">
+      <div class="head">
+        <div id="progress-text" class="small"></div>
+        <div class="progress"><div id="progress-bar" style="width:0"></div></div>
+        <select id="filter">
+          <option value="todo">To review</option>
+          <option value="done">Reviewed</option>
+          <option value="all">All photos</option>
+        </select>
+      </div>
+      <div class="image-list" id="image-list"></div>
+    </aside>
+
+    <section class="stage">
+      <div class="bar">
+        <button id="prev" title="Previous (←)">←</button>
+        <button id="next" title="Next (→)">→</button>
+        <span class="title" id="title">—</span>
+        <span id="unsaved" class="badge" style="color:var(--accent);border-color:var(--accent)" hidden>UNSAVED</span>
+        <span class="spacer" style="flex:1"></span>
+        <button id="suggest" title="Ask the models for boxes again (G)">✨ Propose</button>
+        <button id="reject-photo" class="danger" title="Photo is unusable: remove it from the dataset">Reject photo</button>
+        <button id="no-objects" title="Nothing to box in this photo: save with no boxes">Nothing here</button>
+        <button id="save" class="primary" title="Save and go to the next photo to review (Enter)">Save &amp; next</button>
+      </div>
+      <div class="canvas-wrap" id="wrap"><canvas id="canvas"></canvas></div>
+      <div class="status small" id="status"></div>
+    </section>
+
+    <aside class="panel">
+      <div>
+        <h3>Reviewer</h3>
+        <input type="text" id="reviewer" placeholder="Your name" style="width:100%">
+      </div>
+      <div>
+        <h3>Classes</h3>
+        <div class="class-list" id="class-list"></div>
+        <p class="muted small">New boxes get the highlighted class. Number = accepted boxes so far.</p>
+        <details>
+          <summary class="small">Add a class / edit a prompt</summary>
+          <div class="class-form">
+            <input type="text" id="class-name" placeholder="name, e.g. sofa">
+            <input type="text" id="class-category" placeholder="category, e.g. furniture">
+            <input type="text" id="class-prompt" placeholder="search words (optional)">
+            <button id="class-save">Save class</button>
+            <p class="muted small">Same name as an existing class = update its category and search words.
+              Search words are what Grounding DINO looks for (e.g. “stiletto” for heel); keep them distinct between classes.</p>
+          </div>
+        </details>
+      </div>
+      <div>
+        <h3>Proposals</h3>
+        <label class="small"><input type="checkbox" id="auto-suggest" checked> Ask the models when a photo has no boxes yet</label>
+      </div>
+      <div>
+        <h3>Keys</h3>
+        <div class="keys">
+          <span>drag</span><span>draw a box</span>
+          <span>click</span><span>select box (drag to move, handles to resize)</span>
+          <span><kbd>1</kbd>–<kbd>9</kbd></span><span>set class (selected box + new boxes)</span>
+          <span><kbd>⌫</kbd></span><span>delete selected box</span>
+          <span><kbd>G</kbd></span><span>ask the models again</span>
+          <span><kbd>Enter</kbd></span><span>save &amp; next to review</span>
+          <span><kbd>S</kbd></span><span>save</span>
+          <span><kbd>←</kbd> <kbd>→</kbd></span><span>previous / next</span>
+          <span><kbd>Esc</kbd></span><span>deselect</span>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const canvas = $("canvas"), ctx = canvas.getContext("2d");
+const HANDLE = 7;   // size (px) of the little squares used to resize a selected box
+const MIN_BOX = 4;  // a drag shorter than this (px) counts as a click, not a new box
+
+// Everything the page knows. Box corners are always 0-1 fractions of the photo, the same as
+// the catalog stores them, and only converted to screen pixels when drawing.
+const state = {
+  classes: [],         // [{id, name, category, prompt}] from the catalog; keys 1-9 follow this order
+  acceptedBoxes: {},   // class id -> accepted boxes so far
+  photos: [],          // review queue: [{id, original_name, sku, reviewed, n_accepted, n_proposed}]
+  current: null,       // the photo being reviewed (an entry of `photos`)
+  img: null,           // its processed image, loaded as an <img>
+  boxes: [],           // its boxes: {id?, class_id, x1, y1, x2, y2, made_by?, score?, status}
+  selected: -1,        // index into `boxes` of the selected box, -1 = none
+  cls: null,           // class id given to new boxes
+  dirty: false,        // unsaved changes?
+  view: { ox: 0, oy: 0, w: 1, h: 1 },  // where the photo sits on the canvas (px offset + size)
+  drag: null,          // what the mouse is currently doing: draw / move / resize
+  mouse: null,         // last mouse position on the canvas, for the crosshair
+  loadToken: 0,        // increases on every photo switch, so slow responses for an old photo are ignored
+};
+
+// localStorage remembers small preferences (try/catch: some private-browsing modes block it).
+function storageGet(key, fallback) { try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; } }
+function storageSet(key, value) { try { localStorage.setItem(key, value); } catch {} }
+const setStatus = (text, isError = false) => { $("status").textContent = text; $("status").style.color = isError ? "var(--danger)" : ""; };
+const jsonBody = (data) => ({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+
+// ================================================================ loading
+
+async function init() {
+  $("reviewer").value = storageGet("upload.name", "");  // same name as on the Upload page
+  $("filter").value = storageGet("review.filter", "todo");
+  $("auto-suggest").checked = storageGet("review.autoSuggest", "1") === "1";
+  await loadClasses();
+  await refreshQueue();
+  const first = visiblePhotos()[0] || state.photos[0];
+  if (first) openPhoto(first.id);
+  else setStatus("No accepted photos yet — upload some on the Upload page.");
+}
+
+async function loadClasses() {
+  const data = await api("/api/classes");
+  state.classes = data.classes;
+  state.acceptedBoxes = data.accepted_boxes;
+  if (!state.classes.some((c) => c.id === state.cls)) state.cls = state.classes[0]?.id ?? null;
+  renderClasses();
+}
+
+async function refreshQueue() {
+  state.photos = (await api("/api/review")).photos;
+  renderSidebar();
+}
+
+// The photos the sidebar's filter lets through.
+function visiblePhotos() {
+  const filter = $("filter").value;
+  return state.photos.filter((p) => filter === "all" ? true : filter === "todo" ? !p.reviewed : p.reviewed);
+}
+
+// Show a photo with its current boxes. If it has none and was never reviewed, ask the models.
+async function openPhoto(id) {
+  if (state.dirty && !confirm("You have unsaved changes on this photo. Discard them?")) return;
+  const token = ++state.loadToken;
+  const entry = state.photos.find((p) => p.id === id);
+  setStatus("Loading…");
+  try {
+    const [img, data] = await Promise.all([loadImage(`/api/photos/${id}/processed`), api(`/api/review/${id}`)]);
+    if (token !== state.loadToken) return;  // the user already moved on to another photo
+    Object.assign(state, { current: entry, img, boxes: data.boxes, selected: -1, dirty: false, drag: null });
+    $("title").textContent = entry.original_name + (entry.sku ? `  ·  SKU ${entry.sku}` : "");
+    renderSidebar();
+    layout();
+    setStatus(entry.reviewed ? `Reviewed · ${state.boxes.length} box${state.boxes.length === 1 ? "" : "es"}` : describeProposals());
+    if (!entry.reviewed && !state.boxes.length && $("auto-suggest").checked) propose();
+  } catch (e) {
+    if (token === state.loadToken) setStatus(e.message, true);
+  }
+}
+
+function describeProposals() {
+  const proposed = state.boxes.filter((b) => b.status === "proposed").length;
+  return proposed
+    ? `${proposed} proposed box${proposed > 1 ? "es" : ""} (dashed). Check each class, delete wrong ones, draw any missed — then Enter.`
+    : "Not reviewed yet.";
+}
+
+// ================================================================ proposing, saving, rejecting
+
+// Ask the server to run the models on this photo; it stores their boxes as "proposed".
+async function propose() {
+  if (!state.current) return;
+  const id = state.current.id, token = state.loadToken;
+  setStatus("Asking the models…");
+  try {
+    const res = await api(`/api/review/${id}/auto-label`, { method: "POST" });
+    if (token !== state.loadToken) return;
+    // Add proposals we don't have yet; keep any unsaved edits on the page.
+    const known = new Set(state.boxes.map((b) => b.id).filter(Boolean));
+    const fresh = res.boxes.filter((b) => !known.has(b.id));
+    state.boxes.push(...fresh);
+    draw();
+    setStatus(fresh.length ? describeProposals() + `  (from ${res.used.join(" + ")})` : `${res.used.join(" + ")} found nothing new. Draw boxes yourself, or “Nothing here”.`);
+  } catch (e) {
+    if (token === state.loadToken) setStatus(`Proposing failed: ${e.message}`, true);
+  }
+}
+
+// Save this photo's boxes as reviewed. With advance=true, then open the next photo to review.
+async function save({ advance = false } = {}) {
+  if (!state.current) return;
+  const reviewer = $("reviewer").value.trim();
+  if (!reviewer) { setStatus("Enter your name (Reviewer, top right) before saving.", true); $("reviewer").focus(); return; }
+  storageSet("upload.name", reviewer);
+  const id = state.current.id;
+  try {
+    const boxes = state.boxes.map(({ id, class_id, x1, y1, x2, y2 }) => ({ id: id ?? null, class_id, x1, y1, x2, y2 }));
+    const counts = await api(`/api/review/${id}`, { method: "PUT", ...jsonBody({ reviewer, boxes }) });
+    state.dirty = false;
+    await Promise.all([refreshQueue(), loadClasses()]);
+    setStatus(`Saved: ${counts.accepted} accepted as proposed, ${counts.drawn_or_fixed} drawn/fixed by you, ${counts.rejected} rejected.`);
+    if (advance) openNextToReview(id);
+    else openPhoto(id);  // reload: boxes now carry their new ids and statuses
+  } catch (e) {
+    setStatus(`Save failed: ${e.message}`, true);
+  }
+}
+
+// Next photo still to review after `afterId`, wrapping around to the start.
+function openNextToReview(afterId) {
+  const order = state.photos.map((p) => p.id);
+  const start = order.indexOf(afterId);
+  const next = [...state.photos.slice(start + 1), ...state.photos.slice(0, Math.max(start, 0))].find((p) => !p.reviewed);
+  if (next) openPhoto(next.id);
+  else setStatus("Every photo is reviewed 🎉");
+}
+
+// The photo itself is unusable (blurry, off-topic...): mark it rejected so it leaves the dataset.
+async function rejectPhoto() {
+  if (!state.current || !confirm("Reject this whole photo? It leaves the review queue and won't be used for training.")) return;
+  const id = state.current.id;
+  try {
+    await api(`/api/review/${id}/reject`, { method: "POST", ...jsonBody({ reviewer: $("reviewer").value }) });
+    state.dirty = false;
+    await refreshQueue();
+    openNextToReview(id);
+  } catch (e) {
+    setStatus(`Reject failed: ${e.message}`, true);
+  }
+}
+
+// Add a class, or update an existing class's category/search words.
+async function saveClass() {
+  try {
+    const data = await api("/api/classes", { method: "POST", ...jsonBody({
+      name: $("class-name").value, category: $("class-category").value, prompt: $("class-prompt").value }) });
+    state.classes = data.classes;
+    state.acceptedBoxes = data.accepted_boxes;
+    renderClasses();
+    for (const id of ["class-name", "class-category", "class-prompt"]) $(id).value = "";
+    setStatus("Class saved.");
+  } catch (e) {
+    setStatus(`Class not saved: ${e.message}`, true);
+  }
+}
+
+// ================================================================ drawing
+
+// Size the canvas to its container and work out where the photo goes (fit, centered).
+function layout() {
+  const wrap = $("wrap"), dpr = window.devicePixelRatio || 1;
+  canvas.width = wrap.clientWidth * dpr;  // full resolution on Retina screens
+  canvas.height = wrap.clientHeight * dpr;
+  if (state.img) {
+    const pad = 16;
+    const scale = Math.min((wrap.clientWidth - 2 * pad) / state.img.naturalWidth, (wrap.clientHeight - 2 * pad) / state.img.naturalHeight);
+    const w = state.img.naturalWidth * scale, h = state.img.naturalHeight * scale;
+    state.view = { ox: (wrap.clientWidth - w) / 2, oy: (wrap.clientHeight - h) / 2, w, h };
+  }
+  draw();
+}
+
+// Fractions -> canvas pixels, and canvas pixels -> fractions (kept inside the photo).
+const toPx = (b) => ({
+  x1: state.view.ox + b.x1 * state.view.w, y1: state.view.oy + b.y1 * state.view.h,
+  x2: state.view.ox + b.x2 * state.view.w, y2: state.view.oy + b.y2 * state.view.h,
+});
+const toFraction = (x, y) => ({
+  x: Math.min(1, Math.max(0, (x - state.view.ox) / state.view.w)),
+  y: Math.min(1, Math.max(0, (y - state.view.oy) / state.view.h)),
+});
+const className = (id) => state.classes.find((c) => c.id === id)?.name ?? `class ${id}`;
+
+// Label shown on a box: class, plus who proposed it and how sure it was, while still a proposal.
+function boxLabel(b) {
+  if (b.status !== "proposed") return className(b.class_id);
+  const source = b.made_by?.startsWith("model:") ? "model" : "dino";
+  return `${className(b.class_id)} · ${source} ${b.score != null ? (b.score * 100).toFixed(0) + "%" : ""}`;
+}
+
+// Redraw everything: photo, boxes, resize handles of the selected box, crosshair.
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  $("unsaved").hidden = !state.dirty;
+  if (!state.img) return;
+  const { ox, oy, w, h } = state.view;
+  ctx.drawImage(state.img, ox, oy, w, h);
+
+  state.boxes.forEach((b, i) => {
+    drawBox(ctx, toPx(b), classColor(b.class_id), boxLabel(b), { dashed: b.status === "proposed", selected: i === state.selected });
+  });
+
+  if (state.selected >= 0) {
+    ctx.fillStyle = "#fff";
+    ctx.strokeStyle = classColor(state.boxes[state.selected].class_id);
+    ctx.lineWidth = 1.5;
+    for (const [x, y] of Object.values(handles(toPx(state.boxes[state.selected])))) {
+      ctx.fillRect(x - HANDLE / 2 - 1, y - HANDLE / 2 - 1, HANDLE + 2, HANDLE + 2);
+      ctx.strokeRect(x - HANDLE / 2 - 1, y - HANDLE / 2 - 1, HANDLE + 2, HANDLE + 2);
+    }
+  }
+
+  // Dashed crosshair through the mouse, to line box edges up with the object precisely.
+  if (state.mouse && (!state.drag || state.drag.mode === "draw")) {
+    const { x, y } = state.mouse;
+    if (x >= ox && x <= ox + w && y >= oy && y <= oy + h) {
+      ctx.save();
+      ctx.strokeStyle = "rgba(255,255,255,0.7)";
+      ctx.setLineDash([4, 4]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(ox, y); ctx.lineTo(ox + w, y);
+      ctx.moveTo(x, oy); ctx.lineTo(x, oy + h);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+// The 8 resize handles of a box (corners + edge midpoints), named by compass direction.
+function handles(p) {
+  const mx = (p.x1 + p.x2) / 2, my = (p.y1 + p.y2) / 2;
+  return { nw: [p.x1, p.y1], n: [mx, p.y1], ne: [p.x2, p.y1], e: [p.x2, my],
+           se: [p.x2, p.y2], s: [mx, p.y2], sw: [p.x1, p.y2], w: [p.x1, my] };
+}
+
+// Which handle of the selected box is under (x, y), if any.
+function hitHandle(x, y) {
+  if (state.selected < 0) return null;
+  for (const [name, [hx, hy]] of Object.entries(handles(toPx(state.boxes[state.selected])))) {
+    if (Math.abs(x - hx) <= HANDLE && Math.abs(y - hy) <= HANDLE) return name;
+  }
+  return null;
+}
+
+// Which box is under (x, y). If several overlap, the smallest wins, so a box inside a
+// bigger box can still be clicked.
+function hitBox(x, y) {
+  let best = -1, bestArea = Infinity;
+  state.boxes.forEach((b, i) => {
+    const p = toPx(b);
+    const area = (p.x2 - p.x1) * (p.y2 - p.y1);
+    if (x >= p.x1 && x <= p.x2 && y >= p.y1 && y <= p.y2 && area < bestArea) { best = i; bestArea = area; }
+  });
+  return best;
+}
+
+// ================================================================ mouse
+
+const CURSORS = { nw: "nwse-resize", se: "nwse-resize", ne: "nesw-resize", sw: "nesw-resize", n: "ns-resize", s: "ns-resize", e: "ew-resize", w: "ew-resize" };
+
+// Mouse down decides what this drag will do:
+//   on a handle of the selected box -> resize it
+//   on a box                        -> select it (and move it if the mouse moves)
+//   anywhere else                   -> start drawing a new box
+canvas.addEventListener("mousedown", (e) => {
+  if (!state.img || e.button !== 0) return;
+  const x = e.offsetX, y = e.offsetY;
+  const handle = hitHandle(x, y);
+  if (handle) {
+    state.drag = { mode: "resize", handle, box: { ...state.boxes[state.selected] } };
+    return;
+  }
+  const hit = hitBox(x, y);
+  if (hit >= 0) {
+    state.selected = hit;
+    state.drag = { mode: "move", start: toFraction(x, y), box: { ...state.boxes[hit] } };
+  } else {
+    state.selected = -1;
+    state.drag = { mode: "draw", start: toFraction(x, y), startPx: { x, y } };
+  }
+  draw();
+});
+
+// Mouse move: update the drag in progress, or just the cursor shape + crosshair.
+// Listens on the whole window so a drag keeps working if the mouse leaves the canvas.
+// (Edited boxes keep their id: the server sees the changed position and records the fix.)
+window.addEventListener("mousemove", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  state.mouse = x >= 0 && y >= 0 && x <= rect.width && y <= rect.height ? { x, y } : null;
+  const d = state.drag;
+  if (!d) {
+    const handle = hitHandle(x, y);
+    canvas.style.cursor = handle ? CURSORS[handle] : hitBox(x, y) >= 0 ? "move" : "crosshair";
+    draw();
+    return;
+  }
+  const p = toFraction(x, y);
+  if (d.mode === "draw") {
+    // Only create the box once the mouse has moved far enough to be a real drag.
+    if (Math.abs(x - d.startPx.x) < MIN_BOX && Math.abs(y - d.startPx.y) < MIN_BOX && state.selected < 0) { draw(); return; }
+    if (state.selected < 0) {
+      state.boxes.push({ class_id: state.cls, x1: d.start.x, y1: d.start.y, x2: p.x, y2: p.y, status: "new" });
+      state.selected = state.boxes.length - 1;
+    }
+    Object.assign(state.boxes[state.selected], {
+      x1: Math.min(d.start.x, p.x), y1: Math.min(d.start.y, p.y), x2: Math.max(d.start.x, p.x), y2: Math.max(d.start.y, p.y),
+    });
+    state.dirty = true;
+  } else if (d.mode === "move") {
+    // Shift the whole box by how far the mouse moved, without letting it leave the photo.
+    const b = state.boxes[state.selected], o = d.box;
+    const dx = Math.min(Math.max(p.x - d.start.x, -o.x1), 1 - o.x2);
+    const dy = Math.min(Math.max(p.y - d.start.y, -o.y1), 1 - o.y2);
+    if (dx || dy) { Object.assign(b, { x1: o.x1 + dx, x2: o.x2 + dx, y1: o.y1 + dy, y2: o.y2 + dy, status: "edited" }); state.dirty = true; }
+  } else if (d.mode === "resize") {
+    // Move only the edges named by the handle ("nw" = top + left edges, "e" = right edge...).
+    const b = state.boxes[state.selected], o = d.box, h = d.handle;
+    let { x1, y1, x2, y2 } = o;
+    if (h.includes("w")) x1 = p.x;
+    if (h.includes("e")) x2 = p.x;
+    if (h.includes("n")) y1 = p.y;
+    if (h.includes("s")) y2 = p.y;
+    Object.assign(b, { x1: Math.min(x1, x2), x2: Math.max(x1, x2), y1: Math.min(y1, y2), y2: Math.max(y1, y2), status: "edited" });
+    state.dirty = true;
+  }
+  draw();
+});
+
+// Mouse up ends the drag. A newly drawn box that ended up tiny is thrown away.
+window.addEventListener("mouseup", () => {
+  if (state.drag?.mode === "draw" && state.selected >= 0) {
+    const p = toPx(state.boxes[state.selected]);
+    if (p.x2 - p.x1 < MIN_BOX || p.y2 - p.y1 < MIN_BOX) { state.boxes.splice(state.selected, 1); state.selected = -1; }
+  }
+  state.drag = null;
+  draw();
+});
+
+canvas.addEventListener("mouseleave", () => { if (!state.drag) { state.mouse = null; draw(); } });
+
+// ================================================================ keyboard & buttons
+
+// Choose the class for new boxes, and change the selected box (if any) to it.
+function setClass(classId) {
+  if (!state.classes.some((c) => c.id === classId)) return;
+  state.cls = classId;
+  if (state.selected >= 0) {
+    Object.assign(state.boxes[state.selected], { class_id: classId, status: "edited" });
+    state.dirty = true;
+  }
+  renderClasses();
+  draw();
+}
+
+function deleteSelected() {
+  if (state.selected < 0) return;
+  state.boxes.splice(state.selected, 1);
+  state.selected = -1;
+  state.dirty = true;
+  draw();
+}
+
+// Previous/next photo within the sidebar's current filter.
+function step(delta) {
+  const list = visiblePhotos();
+  if (!list.length) return;
+  const i = list.findIndex((p) => p.id === state.current?.id);
+  const next = list[i < 0 ? 0 : Math.min(Math.max(i + delta, 0), list.length - 1)];
+  if (next && next.id !== state.current?.id) openPhoto(next.id);
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;  // typing in a form field
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") { e.preventDefault(); save(); return; }
+  if (e.metaKey || e.ctrlKey || e.altKey) return;  // leave other browser shortcuts alone
+  if (/^[1-9]$/.test(e.key)) { const c = state.classes[+e.key - 1]; if (c) setClass(c.id); }  // key 1 = first class
+  else if (e.key === "Backspace" || e.key === "Delete") { e.preventDefault(); deleteSelected(); }
+  else if (e.key === "Escape") { state.selected = -1; draw(); }
+  else if (e.key === "Enter") { e.preventDefault(); save({ advance: true }); }
+  else if (e.key.toLowerCase() === "s") save();
+  else if (e.key.toLowerCase() === "g") propose();
+  else if (e.key === "ArrowRight") step(1);
+  else if (e.key === "ArrowLeft") step(-1);
+});
+
+$("save").addEventListener("click", () => save({ advance: true }));
+$("no-objects").addEventListener("click", () => { state.boxes = []; state.selected = -1; save({ advance: true }); });
+$("reject-photo").addEventListener("click", rejectPhoto);
+$("suggest").addEventListener("click", propose);
+$("prev").addEventListener("click", () => step(-1));
+$("next").addEventListener("click", () => step(1));
+$("class-save").addEventListener("click", saveClass);
+$("filter").addEventListener("change", (e) => { storageSet("review.filter", e.target.value); renderSidebar(); });
+$("auto-suggest").addEventListener("change", (e) => storageSet("review.autoSuggest", e.target.checked ? "1" : "0"));
+$("reviewer").addEventListener("change", (e) => storageSet("upload.name", e.target.value.trim()));
+window.addEventListener("resize", layout);
+window.addEventListener("beforeunload", (e) => { if (state.dirty) e.preventDefault(); });  // warn before losing edits
+
+// ================================================================ side panels
+
+// Left: progress bar + the filtered review queue (green dot = reviewed, number = accepted boxes).
+function renderSidebar() {
+  const total = state.photos.length, done = state.photos.filter((p) => p.reviewed).length;
+  $("progress-text").innerHTML = `<b>${done}</b> / ${total} reviewed`;
+  $("progress-bar").style.width = total ? `${(100 * done) / total}%` : "0";
+  const list = visiblePhotos();
+  const emptyText = $("filter").value === "todo" && total ? "Everything is reviewed. Choose “All photos” to look back." : "Nothing here.";
+  $("image-list").innerHTML = list.length ? list.map((p) => `
+    <div class="row ${p.id === state.current?.id ? "current" : ""}" data-id="${p.id}">
+      <span class="dot ${p.reviewed ? "done" : ""}"></span>
+      <span class="name" title="${escapeHtml(p.original_name)}">${escapeHtml(p.original_name)}${p.sku ? ` <span class="muted small">${escapeHtml(p.sku)}</span>` : ""}</span>
+      <span class="muted small">${p.reviewed ? p.n_accepted : p.n_proposed ? p.n_proposed + "?" : ""}</span>
+    </div>`).join("") : `<div class="row muted">${emptyText}</div>`;
+  $("image-list").querySelector(".current")?.scrollIntoView({ block: "nearest" });
+}
+
+$("image-list").addEventListener("click", (e) => {
+  const row = e.target.closest(".row[data-id]");
+  if (row) openPhoto(row.dataset.id);
+});
+
+// Right: one button per class, with its key number, color and accepted-box count.
+function renderClasses() {
+  $("class-list").innerHTML = state.classes.map((c, i) => `
+    <button class="${c.id === state.cls ? "active" : ""}" data-cls="${c.id}" title="${escapeHtml(c.category)} · searches for “${escapeHtml(c.prompt)}”">
+      ${i < 9 ? `<kbd>${i + 1}</kbd>` : ""}<span class="swatch" style="background:${classColor(c.id)}"></span>${escapeHtml(c.name)}
+      <span class="count">${state.acceptedBoxes[c.id] ?? 0}</span>
+    </button>`).join("");
+}
+
+$("class-list").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-cls]");
+  if (btn) setClass(+btn.dataset.cls);
+});
+
+init().catch((e) => setStatus(e.message, true));
+</script>
+</body>
+</html>

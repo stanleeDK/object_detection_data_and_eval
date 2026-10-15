@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.DS_Store
+
+# Large / personal files: photos, labels, trained models, downloaded weights
+data/
+output/
+models/
+
+# Personal notes
+doc.md
+design.md

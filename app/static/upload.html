@@ -1,0 +1,140 @@
+<!doctype html>
+<!--
+  Upload page: choose photos (phone or laptop), give each an optional SKU, upload.
+  Photos are sent one at a time to POST /api/photos, which runs the pipeline (app/ingest.py)
+  and answers accepted / rejected (+ why) / already uploaded. Shown per row as it happens.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Upload Photos</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/common.js"></script>
+</head>
+<body>
+  <header>
+    <h1>👟 Shoe Detector</h1>
+    <nav><a href="/upload" class="active">Upload</a><a href="/photos">Photos</a><a href="/review">Review</a><a href="/eval">Eval sets</a><a href="/train">Train</a><a href="/results">Results</a><a href="/">Detect</a></nav>
+  </header>
+
+  <main class="page">
+    <div class="toolbar">
+      <label>Your name <input type="text" id="name" placeholder="e.g. Sam" autocomplete="name"></label>
+      <!-- accept: images, plus .heic/.heif explicitly because some browsers don't list them as images -->
+      <input type="file" id="files" multiple accept="image/*,.heic,.heif">
+    </div>
+
+    <div id="notice" class="notice" hidden></div>
+
+    <div id="rows" class="upload-rows"></div>
+
+    <div class="toolbar" id="actions" hidden>
+      <button id="upload" class="primary">Upload</button>
+      <button id="clear">Clear list</button>
+      <span id="summary" class="muted small"></span>
+    </div>
+  </main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+// One entry per chosen file: {file, row (its <div>), status: "waiting" | "done" | "error"}.
+let items = [];
+
+// Remember the uploader's name between visits (try/catch: some private modes block storage).
+try { $("name").value = localStorage.getItem("upload.name") || ""; } catch {}
+$("name").addEventListener("change", () => { try { localStorage.setItem("upload.name", $("name").value); } catch {} });
+
+// Files chosen: show one row per photo with a preview, the file name and its own SKU box.
+$("files").addEventListener("change", (e) => {
+  for (const file of e.target.files) {
+    const row = document.createElement("div");
+    row.className = "upload-row";
+    row.innerHTML = `
+      <img class="preview" alt="">
+      <div class="file">
+        <div class="name"></div>
+        <div class="muted small">${(file.size / 1024 / 1024).toFixed(1)} MB</div>
+      </div>
+      <label class="sku">SKU <input type="text" placeholder="optional"></label>
+      <div class="result muted small">waiting</div>`;
+    row.querySelector(".name").textContent = file.name;
+    // Preview straight from the file. Browsers other than Safari can't show HEIC: show a label instead.
+    const preview = row.querySelector(".preview");
+    preview.onerror = () => preview.replaceWith(Object.assign(document.createElement("div"), { className: "preview none", textContent: "no preview" }));
+    preview.src = URL.createObjectURL(file);
+    $("rows").append(row);
+    items.push({ file, row, status: "waiting" });
+  }
+  e.target.value = "";  // allow choosing the same files again
+  $("actions").hidden = !items.length;
+});
+
+// Upload every waiting photo, one after another. All photos from one press of the button
+// share an upload_batch id.
+$("upload").addEventListener("click", async () => {
+  const name = $("name").value.trim();
+  if (!name) { showNotice("Please enter your name first.", true); $("name").focus(); return; }
+  showNotice("");
+  const batch = "batch-" + new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "") + "-" + Math.random().toString(36).slice(2, 6);
+  const waiting = items.filter((item) => item.status === "waiting");
+  setBusy(true);
+  const counts = { accepted: 0, rejected: 0, already: 0, error: 0 };
+
+  for (const [i, item] of waiting.entries()) {
+    const result = item.row.querySelector(".result");
+    result.textContent = "uploading…";
+    $("summary").textContent = `${i + 1} / ${waiting.length}`;
+    const body = new FormData();
+    body.append("file", item.file);
+    body.append("sku", item.row.querySelector(".sku input").value);
+    body.append("uploaded_by", name);
+    body.append("upload_batch", batch);
+    try {
+      const { photo, already_uploaded } = await api("/api/photos", { method: "POST", body });
+      item.status = "done";
+      item.row.querySelector(".sku input").disabled = true;
+      if (already_uploaded) {
+        counts.already++;
+        result.innerHTML = `<span class="muted">already uploaded earlier (${photo.status})</span>`;
+      } else if (photo.status === "accepted") {
+        counts.accepted++;
+        result.innerHTML = `<span class="ok">✓ accepted</span>`;
+      } else {
+        counts.rejected++;
+        result.innerHTML = `<span class="bad">✗ rejected</span><br>${escapeHtml(photo.check_notes || "")}`;
+      }
+    } catch (err) {
+      item.status = "error";  // stays retryable: press Upload again
+      counts.error++;
+      result.innerHTML = `<span class="bad">failed: ${escapeHtml(err.message)}</span>`;
+    }
+  }
+
+  setBusy(false);
+  $("summary").innerHTML = `${counts.accepted} accepted · ${counts.rejected} rejected · ${counts.already} already uploaded` +
+    (counts.error ? ` · <span class="bad">${counts.error} failed (press Upload to retry)</span>` : "") +
+    ` — <a href="/photos">see them on the Photos page</a>`;
+  items.filter((item) => item.status === "error").forEach((item) => (item.status = "waiting"));
+});
+
+$("clear").addEventListener("click", () => {
+  items = [];
+  $("rows").innerHTML = "";
+  $("summary").textContent = "";
+  $("actions").hidden = true;
+});
+
+function setBusy(busy) {
+  for (const id of ["upload", "clear", "files", "name"]) $(id).disabled = busy;
+}
+
+function showNotice(text, isError = false) {
+  $("notice").textContent = text;
+  $("notice").className = "notice" + (isError ? " error" : "");
+  $("notice").hidden = !text;
+}
+</script>
+</body>
+</html>

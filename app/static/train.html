@@ -1,0 +1,125 @@
+<!doctype html>
+<!--
+  Train page: freeze the reviewed photos into a dataset version, copy the command that trains
+  on it, and see the trained models. Rules and export format: app/datasets.py.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Train</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/common.js"></script>
+</head>
+<body>
+  <header>
+    <h1>👟 Shoe Detector</h1>
+    <nav><a href="/upload">Upload</a><a href="/photos">Photos</a><a href="/review">Review</a><a href="/eval">Eval sets</a><a href="/train" class="active">Train</a><a href="/results">Results</a><a href="/">Detect</a></nav>
+  </header>
+
+  <main class="page">
+    <div id="notice" class="notice" hidden></div>
+
+    <section class="card">
+      <h2>Next dataset version</h2>
+      <p class="muted small">Freezing takes every photo that is accepted, reviewed and not in an eval set, with its
+        current boxes, and exports it for training. Later reviews don't change a frozen version.</p>
+      <div id="preview" class="counts"></div>
+      <p id="left-out" class="muted small"></p>
+      <div class="toolbar">
+        <label class="small">Validation share <input type="number" id="val-percent" value="15" min="1" max="50" style="width:64px"> %</label>
+        <input type="text" id="notes" placeholder="notes (optional)">
+        <button id="freeze" class="primary">Freeze &amp; export…</button>
+      </div>
+      <p class="muted small">Validation photos aren't learned from; training uses them to pick its best epoch.</p>
+    </section>
+
+    <section>
+      <h2>Dataset versions</h2>
+      <div id="versions" class="stack"></div>
+    </section>
+
+    <section>
+      <h2>Trained models</h2>
+      <p class="muted small">Found automatically in <code>output/models/</code>. Score them and choose which one the app
+        uses on the <a href="/results">Results</a> page (until you choose, the app uses the newest model at start-up).</p>
+      <div id="models" class="stack"></div>
+    </section>
+  </main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let classNames = {};
+
+// Draw "3 × sneaker" chips from {class id: count}.
+const chips = (counts) => Object.entries(counts)
+  .map(([cls, n]) => `<span class="chip"><span class="swatch" style="background:${classColor(+cls)}"></span>${n} × ${escapeHtml(classNames[cls] ?? cls)}</span>`).join("");
+
+function render(data) {
+  classNames = Object.fromEntries(data.classes.map((c) => [c.id, c.name]));
+  const p = data.preview;
+  $("preview").innerHTML = `<span class="chip">${p.photos} photos</span>` + chips(p.boxes_per_class) +
+    (p.empty_photos ? `<span class="chip">${p.empty_photos} with nothing in them</span>` : "");
+  $("left-out").textContent = `Left out: ${p.left_out_in_eval_sets} photo(s) in eval sets, ${p.left_out_not_reviewed} not reviewed yet.`;
+
+  $("versions").innerHTML = data.dataset_versions.length ? data.dataset_versions.map((v) => `
+    <div class="card">
+      <div class="toolbar"><h3 style="margin:0">${escapeHtml(v.name)}</h3>
+        <span class="muted small">frozen ${v.created_at.replace("T", " ")}${v.notes ? " · " + escapeHtml(v.notes) : ""}</span></div>
+      <div class="counts">
+        <span class="chip">${v.summary.train} train</span><span class="chip">${v.summary.val} val</span>
+        ${chips(v.summary.boxes_per_class)}
+        ${v.summary.empty_photos ? `<span class="chip">${v.summary.empty_photos} with nothing in them</span>` : ""}
+      </div>
+      <p class="muted small">Exported to <code>${escapeHtml(v.export_path)}/</code>.
+        Classes in this version: ${Object.entries(v.class_map).map(([i, cls]) => `${i} = ${escapeHtml(classNames[cls] ?? cls)}`).join(", ")}</p>
+      <p class="small">Train it, from the project folder in a terminal (takes ~1–2 h per 1,000 photos on an M-series Mac):</p>
+      <div class="command"><code>${escapeHtml(v.train_command)}</code><button data-copy="${escapeHtml(v.train_command)}">Copy</button></div>
+      <p class="muted small">Quick test run: add <code>train.epochs=3</code> at the end.</p>
+    </div>`).join("") : `<p class="muted">None yet.</p>`;
+
+  $("models").innerHTML = data.models.length ? data.models.map((m) => `
+    <div class="card">
+      <div class="toolbar"><h3 style="margin:0">${escapeHtml(m.id)}</h3>
+        ${m.path === data.loaded_model ? `<span class="badge draft">LOADED IN APP</span>` : ""}</div>
+      <p class="small">Trained on <b>${escapeHtml(m.dataset_version ?? "data from outside the app")}</b> ·
+        classes: ${Object.values(m.class_names).map(escapeHtml).join(", ") || "?"} · finished ${(m.trained_at || "").replace("T", " ")}</p>
+      <p class="muted small"><code>${escapeHtml(m.path)}</code> (metrics and plots are in the same folder)</p>
+    </div>`).join("") : `<p class="muted">None yet.</p>`;
+}
+
+async function load() {
+  render(await api("/api/training"));
+}
+
+$("freeze").addEventListener("click", async () => {
+  if (!confirm("Freeze the current reviewed photos into a new dataset version and export it?")) return;
+  try {
+    showNotice("Exporting…");
+    render(await api("/api/dataset-versions", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ val_percent: +$("val-percent").value, notes: $("notes").value }) }));
+    $("notes").value = "";
+    showNotice("Frozen and exported. Copy the command below to train on it.");
+  } catch (e) {
+    showNotice(e.message, true);
+  }
+});
+
+$("versions").addEventListener("click", async (e) => {
+  const button = e.target.closest("[data-copy]");
+  if (!button) return;
+  try { await navigator.clipboard.writeText(button.dataset.copy); button.textContent = "Copied"; }
+  catch { button.textContent = "Select and copy"; }
+  setTimeout(() => (button.textContent = "Copy"), 1500);
+});
+
+function showNotice(text, isError = false) {
+  $("notice").textContent = text;
+  $("notice").className = "notice" + (isError ? " error" : "");
+  $("notice").hidden = !text;
+}
+
+load().catch((e) => showNotice(e.message, true));
+</script>
+</body>
+</html>

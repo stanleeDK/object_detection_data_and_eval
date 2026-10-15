@@ -1,0 +1,120 @@
+<!doctype html>
+<!--
+  Photos page: browse everything in the catalog (GET /api/photos), filter by status or SKU,
+  click a photo to see its processed image and every fact the pipeline recorded about it.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Photos</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/common.js"></script>
+</head>
+<body>
+  <header>
+    <h1>👟 Shoe Detector</h1>
+    <nav><a href="/upload">Upload</a><a href="/photos" class="active">Photos</a><a href="/review">Review</a><a href="/eval">Eval sets</a><a href="/train">Train</a><a href="/results">Results</a><a href="/">Detect</a></nav>
+  </header>
+
+  <main class="page">
+    <div class="toolbar">
+      <label>Status
+        <select id="status">
+          <option value="">all</option>
+          <option value="accepted">accepted</option>
+          <option value="rejected">rejected</option>
+          <option value="processing">processing</option>
+        </select>
+      </label>
+      <label>SKU <input type="text" id="sku" placeholder="contains…"></label>
+      <span id="count" class="muted small"></span>
+    </div>
+
+    <div id="grid" class="photo-grid"></div>
+  </main>
+
+  <!-- Detail panel, shown when a photo is clicked -->
+  <div id="detail" class="detail" hidden>
+    <div class="detail-box">
+      <button id="close" class="close" title="Close (Esc)">✕</button>
+      <img id="detail-image" alt="">
+      <table id="detail-facts" class="facts"></table>
+    </div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let photos = [];  // the rows currently listed, as returned by the server
+
+// Fetch photos matching the filters and draw the grid.
+async function load() {
+  const params = new URLSearchParams({ status: $("status").value, sku: $("sku").value });
+  photos = (await api(`/api/photos?${params}`)).photos;
+  $("count").textContent = `${photos.length} photo${photos.length === 1 ? "" : "s"}`;
+  $("grid").innerHTML = photos.length ? photos.map((p, i) => `
+    <button class="photo-card" data-index="${i}">
+      ${p.thumb_key ? `<img src="/api/photos/${p.id}/thumb" loading="lazy" alt="">` : `<div class="preview none">no image</div>`}
+      <div class="card-text">
+        <span class="photo-status ${p.status}">${p.status}</span>
+        ${p.sku ? `<span class="small">${escapeHtml(p.sku)}</span>` : ""}
+        <div class="muted small name">${escapeHtml(p.original_name)}</div>
+      </div>
+    </button>`).join("") : `<p class="muted">No photos here yet. <a href="/upload">Upload some</a>.</p>`;
+}
+
+// Show one photo large, with every catalog field in plain words.
+function showDetail(photo) {
+  $("detail-image").src = photo.processed_key ? `/api/photos/${photo.id}/processed` : "";
+  $("detail-image").hidden = !photo.processed_key;
+  const facts = [
+    ["Status", `<span class="photo-status ${photo.status}">${photo.status}</span>`],
+    ["Why", photo.check_notes],
+    ["Duplicate of", photo.duplicate_of && `<a href="#" data-open="${photo.duplicate_of}">${photo.duplicate_of.slice(0, 12)}…</a>`],
+    ["Eval sets", photo.eval_sets],
+    ["SKU", photo.sku],
+    ["Original file", photo.original_name],
+    ["Uploaded by", photo.uploaded_by],
+    ["Uploaded at", photo.uploaded_at],
+    ["Upload batch", photo.upload_batch],
+    ["Device", photo.device],
+    ["Taken at", photo.taken_at],
+    ["Size", photo.width && `${photo.width} × ${photo.height}px`],
+    ["Perceptual hash", photo.phash],
+    ["ID (SHA-256)", `<code>${photo.id}</code>`],
+    ["Stored original", photo.original_key],
+  ];
+  // Plain text fields are escaped; the few HTML ones above are built from our own values.
+  const html = new Set(["Status", "Duplicate of", "ID (SHA-256)"]);
+  $("detail-facts").innerHTML = facts.filter(([, value]) => value).map(([label, value]) =>
+    `<tr><th>${label}</th><td>${html.has(label) ? value : escapeHtml(String(value))}</td></tr>`).join("");
+  $("detail").hidden = false;
+}
+
+$("grid").addEventListener("click", (e) => {
+  const card = e.target.closest(".photo-card");
+  if (card) showDetail(photos[+card.dataset.index]);
+});
+
+// "Duplicate of" link: open that photo (fetched by id, since it may not be in the current filter).
+$("detail-facts").addEventListener("click", async (e) => {
+  const link = e.target.closest("[data-open]");
+  if (!link) return;
+  e.preventDefault();
+  const all = (await api("/api/photos")).photos;
+  const other = all.find((p) => p.id === link.dataset.open);
+  if (other) showDetail(other);
+});
+
+$("close").addEventListener("click", () => ($("detail").hidden = true));
+$("detail").addEventListener("click", (e) => { if (e.target === $("detail")) $("detail").hidden = true; });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("detail").hidden = true; });
+
+$("status").addEventListener("change", load);
+let typingTimer;
+$("sku").addEventListener("input", () => { clearTimeout(typingTimer); typingTimer = setTimeout(load, 300); });
+
+load().catch((e) => ($("grid").innerHTML = `<p class="notice error">${escapeHtml(e.message)}</p>`));
+</script>
+</body>
+</html>

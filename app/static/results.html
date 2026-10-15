@@ -1,0 +1,196 @@
+<!doctype html>
+<!--
+  Results page: every model scored on every frozen eval set (the "results matrix"), which model
+  the app uses, and - for any score - exactly which photos the model got right and wrong.
+  Scoring rules: app/evaluation.py.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Results</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/common.js"></script>
+</head>
+<body>
+  <header>
+    <h1>👟 Shoe Detector</h1>
+    <nav><a href="/upload">Upload</a><a href="/photos">Photos</a><a href="/review">Review</a><a href="/eval">Eval sets</a><a href="/train">Train</a><a href="/results" class="active">Results</a><a href="/">Detect</a></nav>
+  </header>
+
+  <main class="page">
+    <div id="notice" class="notice" hidden></div>
+
+    <section class="card">
+      <div class="toolbar">
+        <h2>Results matrix</h2>
+        <button id="score-missing">Score all missing</button>
+      </div>
+      <p class="muted small">Each cell: <b>F1</b> (0–1, higher is better: the balance of finding objects and not inventing
+        them) at confidence 0.5, with precision / recall below. Compared with the model above it (older), a drop of more than
+        <span id="limit"></span> is <span class="bad">red</span>. Click a score for details.</p>
+      <div class="matrix-wrap"><table id="matrix" class="matrix"></table></div>
+    </section>
+
+    <section class="card" id="detail" hidden>
+      <h2 id="detail-title"></h2>
+      <p id="detail-facts" class="muted small"></p>
+      <div class="matrix-wrap"><table id="class-table" class="matrix"></table></div>
+      <div class="toolbar">
+        <label class="small">Show
+          <select id="photo-filter">
+            <option value="problems">photos with mistakes</option>
+            <option value="all">all photos</option>
+          </select>
+        </label>
+        <span class="small legend">
+          <span class="key found"></span>found <span class="key missed"></span>missed
+          <span class="key false_alarm"></span>false alarm <span class="key wrong_class"></span>wrong class
+        </span>
+      </div>
+      <div id="photos" class="photo-grid wide"></div>
+    </section>
+  </main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const REGRESSION_LIMIT = 0.02;  // a drop bigger than this vs the previous model is shown red (design.md §7.3)
+$("limit").textContent = REGRESSION_LIMIT;
+let data = null;       // GET /api/results
+let classNames = {};
+let currentRun = null; // the run shown in the details section
+const fmt = (x) => (x ?? 0).toFixed(2);
+const jsonBody = (body) => ({ headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+async function load() {
+  render(await api("/api/results"));
+}
+
+// The matrix: one row per model (oldest first, so each row compares with the one above it).
+function render(results) {
+  data = results;
+  classNames = Object.fromEntries(data.classes.map((c) => [c.id, c.name]));
+  const models = [...data.models].sort((a, b) => (a.trained_at || "").localeCompare(b.trained_at || ""));
+  const runFor = (m, e) => data.runs.find((r) => r.model_id === m.id && r.eval_set_id === e.id);
+
+  if (!models.length || !data.eval_sets.length) {
+    $("matrix").innerHTML = `<tr><td class="muted">${!models.length ? "No trained models yet (Train page)." : "No frozen eval sets yet (Eval sets page)."}</td></tr>`;
+    return;
+  }
+  const header = `<tr><th>Model</th>${data.eval_sets.map((e) => `<th>${escapeHtml(e.name)} v${e.version}<div class="muted small">${e.n_photos} photos</div></th>`).join("")}</tr>`;
+  const rows = models.map((m, i) => {
+    const inUse = m.path === data.loaded_model;
+    const cells = data.eval_sets.map((e) => {
+      const run = runFor(m, e);
+      if (!run) return `<td><button class="small" data-score="${escapeHtml(m.id)}|${e.id}">Score</button></td>`;
+      const o = run.metrics.overall;
+      // Compare with the nearest older model that was scored on the same eval set.
+      const previous = models.slice(0, i).reverse().map((p) => runFor(p, e)).find(Boolean);
+      const delta = previous ? o.f1 - previous.metrics.overall.f1 : null;
+      const deltaText = delta === null ? "" : `<span class="${delta < -REGRESSION_LIMIT ? "bad" : "muted"}">${delta >= 0 ? "+" : ""}${fmt(delta)}</span>`;
+      return `<td class="score ${currentRun?.id === run.id ? "current" : ""}" data-run="${run.id}">
+        <b>${fmt(o.f1)}</b> ${deltaText}<div class="muted small">P ${fmt(o.precision)} · R ${fmt(o.recall)}</div></td>`;
+    }).join("");
+    return `<tr><th>
+        <div>${escapeHtml(m.id)}</div>
+        <div class="muted small">trained on ${escapeHtml(m.dataset_version ?? "outside data")}</div>
+        ${inUse ? `<span class="badge draft">IN USE</span>` : `<button class="small" data-use="${escapeHtml(m.id)}">Use this model</button>`}
+      </th>${cells}</tr>`;
+  }).join("");
+  $("matrix").innerHTML = header + rows;
+}
+
+$("matrix").addEventListener("click", async (e) => {
+  const score = e.target.closest("[data-score]"), use = e.target.closest("[data-use]"), cell = e.target.closest("[data-run]");
+  try {
+    if (score) {
+      const [model_id, eval_set_id] = score.dataset.score.split("|");
+      score.textContent = "Scoring…"; score.disabled = true;
+      render(await api("/api/eval-runs", { method: "POST", ...jsonBody({ model_id, eval_set_id: +eval_set_id }) }));
+    } else if (use) {
+      if (!confirm(`Use ${use.dataset.use} for the Detect page and Review proposals?`)) return;
+      render(await api(`/api/models/${encodeURIComponent(use.dataset.use)}/use`, { method: "POST" }));
+      showNotice(`Now using ${use.dataset.use}.`);
+    } else if (cell) {
+      showRun(await api(`/api/eval-runs/${cell.dataset.run}`));
+    }
+  } catch (err) {
+    showNotice(err.message, true);
+    load();
+  }
+});
+
+// Score every model × eval set pair that has no result yet, one at a time.
+$("score-missing").addEventListener("click", async () => {
+  const pairs = [];
+  for (const m of data.models) for (const e of data.eval_sets) {
+    if (!data.runs.some((r) => r.model_id === m.id && r.eval_set_id === e.id)) pairs.push([m.id, e.id]);
+  }
+  for (const [i, [model_id, eval_set_id]] of pairs.entries()) {
+    showNotice(`Scoring ${i + 1} / ${pairs.length}…`);
+    try { render(await api("/api/eval-runs", { method: "POST", ...jsonBody({ model_id, eval_set_id }) })); }
+    catch (err) { showNotice(`${model_id} on eval set ${eval_set_id}: ${err.message}`, true); return; }
+  }
+  showNotice(pairs.length ? `Scored ${pairs.length}.` : "Nothing missing.");
+});
+
+// Details of one run: per-class table + photos with their boxes.
+function showRun(run) {
+  currentRun = run;
+  render(data);
+  const evalSet = data.eval_sets.find((e) => e.id === run.eval_set_id);
+  $("detail").hidden = false;
+  $("detail-title").textContent = `${run.model_id} on ${evalSet ? `${evalSet.name} v${evalSet.version}` : "eval set " + run.eval_set_id}`;
+  const scoredNames = run.scored_classes.map((c) => classNames[c] ?? c);
+  $("detail-facts").textContent = `${run.metrics.photos} photos · scored ${run.run_at.replace("T", " ")} · classes scored: ${scoredNames.join(", ")}` +
+    " (only classes the model knows and every photo was reviewed for)";
+
+  // A class with no objects in the set and no false alarms has nothing to score: show dashes, not zeros.
+  const row = (name, m) => {
+    const nothing = m.objects === 0 && m.false_alarms === 0;
+    const score = (x) => nothing ? "—" : fmt(x);
+    return `<tr><th>${escapeHtml(name)}</th><td>${m.objects}</td><td>${m.correct}</td><td>${m.missed}</td><td>${m.false_alarms}</td>
+      <td>${score(m.precision)}</td><td>${score(m.recall)}</td><td><b>${score(m.f1)}</b></td><td>${m.ap50 < 0 ? "—" : fmt(m.ap50)}</td></tr>`;
+  };
+  $("class-table").innerHTML = `<tr><th>Class</th><th>Objects</th><th>Found</th><th>Missed</th><th>False alarms</th><th>Precision</th><th>Recall</th><th>F1</th><th>AP50</th></tr>` +
+    Object.entries(run.metrics.per_class).map(([c, m]) => row(classNames[c] ?? c, m)).join("") + row("All scored classes", run.metrics.overall);
+  renderPhotos();
+  $("detail").scrollIntoView({ behavior: "smooth" });
+}
+
+// One card per photo: the photo with boxes drawn on top (SVG, in 0-1 coordinates) + a summary.
+function renderPhotos() {
+  const run = currentRun;
+  const problems = (d) => d.truth.some((t) => t.outcome === "missed") || d.predicted.some((p) => p.outcome !== "correct");
+  const photos = $("photo-filter").value === "all" ? run.details : run.details.filter(problems);
+  const rect = (b, outcome, text) => `<rect class="${outcome}" x="${b.x1}" y="${b.y1}" width="${b.x2 - b.x1}" height="${b.y2 - b.y1}"><title>${escapeHtml(text)}</title></rect>`;
+  $("photos").innerHTML = photos.length ? photos.map((d) => {
+    const shapes = [
+      ...d.truth.map((t) => rect(t, t.outcome, `${classNames[t.class_id]}: ${t.outcome}`)),
+      ...d.predicted.filter((p) => p.outcome !== "correct").map((p) => rect(p, p.outcome, `${classNames[p.class_id]} ${(p.score * 100).toFixed(0)}%: ${p.outcome.replace("_", " ")}`)),
+    ].join("");
+    const notes = [
+      ...d.truth.filter((t) => t.outcome === "missed").map((t) => `missed ${classNames[t.class_id]}`),
+      ...d.predicted.filter((p) => p.outcome !== "correct").map((p) => `${p.outcome.replace("_", " ")}: ${classNames[p.class_id]} ${(p.score * 100).toFixed(0)}%`),
+    ];
+    const found = d.truth.filter((t) => t.outcome === "found").length;
+    return `<div class="photo-card">
+      <div class="overlay-wrap"><img src="/api/photos/${d.photo_id}/thumb" loading="lazy" alt="">
+        <svg viewBox="0 0 1 1" preserveAspectRatio="none">${shapes}</svg></div>
+      <div class="card-text small">${found} found${notes.length ? " · " + notes.map(escapeHtml).join(" · ") : " · no mistakes"}</div>
+    </div>`;
+  }).join("") : `<p class="muted">No mistakes on this eval set 🎉</p>`;
+}
+
+$("photo-filter").addEventListener("change", renderPhotos);
+
+function showNotice(text, isError = false) {
+  $("notice").textContent = text;
+  $("notice").className = "notice" + (isError ? " error" : "");
+  $("notice").hidden = !text;
+}
+
+load().catch((e) => showNotice(e.message, true));
+</script>
+</body>
+</html>
